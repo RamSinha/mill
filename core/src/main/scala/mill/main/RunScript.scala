@@ -118,25 +118,49 @@ object RunScript{
   def evaluateTarget[T](evaluator: Evaluator[_],
                         scriptArgs: Seq[String]) = {
 
-    val selectorString = scriptArgs.headOption.getOrElse("")
-    val rest = scriptArgs.drop(1)
+    val dd = scriptArgs.indexOf("--")
+
+    val (selectorStrings, rest) = if(dd == -1) {
+      scriptArgs -> Seq.empty
+    } else {
+      scriptArgs.take(dd) -> scriptArgs.drop(dd+1)
+    }
+
+    pprint.log(selectorStrings)
+    pprint.log(rest)
 
     for {
-      sel <- parseArgs(selectorString)
-      crossSelectors = sel.map{
-        case Mirror.Segment.Cross(x) => x.toList.map(_.toString)
-        case _ => Nil
+      selectors <- {
+        val parsedSel =
+          if(selectorStrings.isEmpty) Seq(Left("Selector cannot be empty"))
+          else selectorStrings.map(parseArgs)
+        val zero: Either[String, List[List[Mirror.Segment]]] = Right(List.empty[List[Mirror.Segment]])
+        parsedSel.foldLeft(zero) { case (acc, el) =>
+          for { a <- acc;  e <- el } yield a :+ e
+        }
       }
-      target <- mill.main.Resolve.resolve(
-        sel, evaluator.mapping.mirror, evaluator.mapping.base,
-        rest, crossSelectors, Nil
-      )
-      (watched, res) = evaluate(evaluator, target)
+      targets <- {
+        val selected = selectors.map { sel =>
+          val crossSelectors = sel.map {
+            case Mirror.Segment.Cross(x) => x.toList.map(_.toString)
+            case _ => Nil
+          }
+          mill.main.Resolve.resolve(
+            sel, evaluator.mapping.mirror, evaluator.mapping.base,
+            rest, crossSelectors, Nil
+          )
+        }
+        val zero: Either[String, List[Task[Any]]] = Right(List.empty[Task[Any]])
+        selected.foldLeft(zero) { case (acc, el) =>
+          for { a <- acc;  e <- el } yield a :+ e
+        }
+      }
+      (watched, res) = evaluate(evaluator, targets)
     } yield (watched, res)
   }
   def evaluate(evaluator: Evaluator[_],
-               target: Task[Any]): (Seq[PathRef], Either[String, Seq[(Any, Option[upickle.Js.Value])]]) = {
-    val evaluated = evaluator.evaluate(OSet(target))
+               targets: Seq[Task[Any]]): (Seq[PathRef], Either[String, Seq[(Any, Option[upickle.Js.Value])]]) = {
+    val evaluated = evaluator.evaluate(OSet.from(targets))
     val watched = evaluated.results
       .iterator
       .collect {
@@ -160,7 +184,7 @@ object RunScript{
 
     evaluated.failing.keyCount match {
       case 0 =>
-        val json = for(t <- Seq(target)) yield {
+        val json = for(t <- targets) yield {
           t match {
             case t: mill.define.NamedTask[_] =>
               for (segments <- evaluator.mapping.modules.get(t.owner)) yield {
@@ -195,8 +219,7 @@ object RunScript{
 
   def parseArgs(selectorString: String): Either[String, List[Mirror.Segment]] = {
     import fastparse.all.Parsed
-    if (selectorString.isEmpty) Left("Selector cannot be empty")
-    else parseSelector(selectorString) match {
+    parseSelector(selectorString) match {
       case f: Parsed.Failure => Left(s"Parsing exception ${f.msg}")
       case Parsed.Success(selector, _) => Right(selector)
     }
